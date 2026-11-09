@@ -1,0 +1,68 @@
+name: Build pstateprobe
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Cross-build for x86_64: the target is an x86_64 Hackintosh, and the
+    # runner is arm64, so without -target the output would not execute there.
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          swiftc --version
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          swiftc -O \
+            -target x86_64-apple-macos11.0 \
+            -framework IOKit \
+            -framework CoreFoundation \
+            -o pstateprobe \
+            PStateProbe.swift 2>&1 | tee build.log
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          test -f pstateprobe || { echo "not produced"; exit 1; }
+          file pstateprobe
+          lipo -info pstateprobe
+          lipo -info pstateprobe | grep -q x86_64 \
+            || { echo "not x86_64"; exit 1; }
+          if lipo -info pstateprobe | grep -q arm64; then
+            echo "unexpectedly contains arm64"; exit 1
+          fi
+          echo "verification OK"
+
+      - name: Package
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          [ -f pstateprobe ] && cp pstateprobe artifacts/ || true
+          ls -l artifacts
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pstateprobe
+          path: artifacts/*
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
