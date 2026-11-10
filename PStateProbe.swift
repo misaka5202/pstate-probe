@@ -10,137 +10,149 @@
 //      if (rt > pmRyzen_p_sutsc)            set_PState(cpu, PState - 1);
 //      else if (rt < pmRyzen_p_sdtsc) { ... set_PState(cpu, PState + 1); }
 //
-//  with thresholds EFF_INTERVAL 0.15 s, step-up 45% busy, step-down 25% busy.
-//  That is the same idea as Windows' automatic boost: watch how much of each
-//  window the core spends running, and move up or down the P-State table.
+//  with EFF_INTERVAL 0.15 s, step-up 45% busy, step-down 25% busy. That is the
+//  same idea as Windows' automatic boost.
 //
-//  Two things can switch it off, and neither is visible without measuring:
+//  Two things switch it off, and neither is exposed:
 //
-//    set_PState() starts with   if (pmRyzen_pstatelimit == 0) return;
-//    so a limit of 0 disables the governor entirely, and a limit of 1 clamps
-//    it to P0/P1 - a range so narrow that the CPU looks pinned.
+//    pmRyzen_pstatelimit == 0   set_PState() returns immediately
+//    _tscFreq missing or zero   pmRyzen_machine_idle() skips the whole block,
+//                               because a zero time base would pin every core
+//                               at P0. htmambo's 0.7.6 added that guard on
+//                               purpose.
 //
-//    pmRyzen_machine_idle() skips the whole block when pmRyzen_tsc_freq == 0,
-//    which happens when the kernel symbol _tscFreq is missing or zero on a
-//    newer macOS. htmambo's 0.7.6 added that guard deliberately, because a
-//    zero time base would make the busy comparison always true and pin every
-//    core at P0.
+//  So the state is inferred from behaviour: sample the P-State index and the
+//  per-core clocks while idle, then while loaded, and compare.
 //
-//  Neither variable is exposed through the IOUserClient, so this tool infers
-//  the state from behaviour instead:
+//  Reading the driver correctly
+//  ----------------------------
+//  Every selector here returns through structureOutput, not scalarOutput -
+//  AMDRyzenCPUPMUserClient.cpp puts the values in dataOut and only sets
+//  scalarOutputCount = 0. The first version of this tool used
+//  IOConnectCallScalarMethod and therefore read nothing at all, which looked
+//  exactly like a dead driver. It uses IOConnectCallMethod throughout now.
 //
-//    * how many P-States the firmware exposes       (selector 0)
-//    * which P-State each core sits at, sampled     (selector 9)
-//    * the effective clock per core, sampled        (selector 4)
-//
-//  If the P-State index moves while the machine is idle then busy, the
-//  governor is alive. If it never moves, it is dead - and that is the answer,
-//  regardless of which of the two guards caused it.
+//    selector  0   kMSR_PSTATE_LEN (8) uint64 P-State definitions
+//    selector  1   kMSR_PSTATE_LEN (8) float  P-State clocks in MHz
+//    selector  4   [power, temp, pstateCur, freq0..freqN-1]
+//    selector  9   1 uint64 - PStateCtl (the target state)
+//    selector 11   2 uint64 - [cpbSupported, cpbState]
 //
 //  Build:
 //    swiftc -O -o pstateprobe PStateProbe.swift
 //
 //  Run:
-//    ./pstateprobe            sample for 20 seconds, then summarise
-//    ./pstateprobe 60         sample for 60 seconds
+//    ./pstateprobe           20 seconds
+//    ./pstateprobe 40        40 seconds
 //
-//  While it runs, be deliberate: sit idle for the first half, then open
-//  something heavy. The summary prints both halves separately so the two
-//  regimes can be compared directly.
+//  Stay idle for the first half, then open something heavy. The two halves are
+//  summarised separately.
 //
 
 import Foundation
 import IOKit
 
-// MARK: - Driver connection
-
-/// Matches the same service the helper app talks to.
 private let serviceName = "AMDRyzenCPUPowerManagement"
+private let kPStateLen = 8
 
 final class Driver {
     private var connect: io_connect_t = 0
 
-    func open() -> Bool {
+    func open() -> (ok: Bool, kr: kern_return_t) {
         let service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                 IOServiceMatching(serviceName))
-        guard service != 0 else { return false }
+                                                  IOServiceMatching(serviceName))
+        guard service != 0 else { return (false, KERN_FAILURE) }
         defer { IOObjectRelease(service) }
 
         let kr = IOServiceOpen(service, mach_task_self_, 0, &connect)
-        return kr == KERN_SUCCESS
+        return (kr == KERN_SUCCESS, kr)
     }
 
     func close() {
-        if connect != 0 {
-            IOServiceClose(connect)
-            connect = 0
+        if connect != 0 { IOServiceClose(connect); connect = 0 }
+    }
+
+    /// Generic structure-output call. Every selector in this driver uses this
+    /// shape: values land in structureOutput, scalarOutputCount is cleared.
+    private func structureCall(_ selector: UInt32,
+                               outBytes: Int) -> (kr: kern_return_t, bytes: [UInt8]) {
+        var out = [UInt8](repeating: 0, count: outBytes)
+        var outSize = outBytes
+        let kr = IOConnectCallMethod(connect, selector,
+                                     nil, 0, nil, 0,
+                                     nil, nil, &out, &outSize)
+        return (kr, out)
+    }
+
+    private func asU64(_ bytes: [UInt8], _ count: Int) -> [UInt64] {
+        var v = [UInt64](repeating: 0, count: count)
+        let need = count * MemoryLayout<UInt64>.size
+        if bytes.count >= need {
+            bytes.withUnsafeBytes { raw in
+                for i in 0..<count { v[i] = raw.load(fromByteOffset: i * 8, as: UInt64.self) }
+            }
         }
+        return v
     }
 
-    /// Selector 0: raw P-State definitions for core 0.
-    /// Returns the number of entries that look populated.
-    func pStateCount() -> Int {
-        var out = [UInt64](repeating: 0, count: 8)
-        var outCount: UInt32 = 8
-        let kr = IOConnectCallScalarMethod(connect, 0, nil, 0, &out, &outCount)
-        guard kr == KERN_SUCCESS else { return 0 }
-
-        // A populated entry has a non-zero frequency id in its low byte.
-        var n = 0
-        for v in out where v != 0 { n += 1 }
-        return n
+    private func asF32(_ bytes: [UInt8], _ count: Int) -> [Float] {
+        var v = [Float](repeating: 0, count: count)
+        let need = count * MemoryLayout<Float>.size
+        if bytes.count >= need {
+            bytes.withUnsafeBytes { raw in
+                for i in 0..<count { v[i] = raw.load(fromByteOffset: i * 4, as: Float.self) }
+            }
+        }
+        return v
     }
 
-    /// Selector 1: P-State clocks in MHz, one per valid state.
-    func pStateClocks() -> [Float] {
-        var out = [Float](repeating: 0, count: 10)
-        var outCount: Int = 10 * MemoryLayout<Float>.size
-        let kr = IOConnectCallMethod(connect, 1, nil, 0, nil, 0,
-                                     nil, nil, &out, &outCount)
-        guard kr == KERN_SUCCESS else { return [] }
-        return out.filter { $0 > 0 }
+    /// Selector 0: raw P-State definitions. A usable entry has a non-zero
+    /// low byte (the enabled/regulator bit plus frequency id).
+    func pStateDefs() -> (kr: kern_return_t, defs: [UInt64]) {
+        let r = structureCall(0, outBytes: kPStateLen * 8)
+        return (r.kr, asU64(r.bytes, kPStateLen))
     }
 
-    /// Selector 4: [power, temperature, pstateCur, freq0, freq1, ...]
-    func metrics() -> [Float] {
-        var out = [Float](repeating: 0, count: 67)
-        var outCount: Int = 67 * MemoryLayout<Float>.size
-        let kr = IOConnectCallMethod(connect, 4, nil, 0, nil, 0,
-                                     nil, nil, &out, &outCount)
-        guard kr == KERN_SUCCESS else { return [] }
-        return out
+    /// Selector 1: P-State clocks in MHz.
+    func pStateClocks() -> (kr: kern_return_t, mhz: [Float]) {
+        let r = structureCall(1, outBytes: kPStateLen * 4)
+        return (r.kr, asF32(r.bytes, kPStateLen))
     }
 
-    /// Selector 9: current P-State index.
-    func currentPState() -> Int? {
-        var out = [UInt64](repeating: 0, count: 1)
-        var outCount: UInt32 = 1
-        let kr = IOConnectCallScalarMethod(connect, 9, nil, 0, &out, &outCount)
-        guard kr == KERN_SUCCESS else { return nil }
-        return Int(out[0])
+    /// Selector 4: [power, temperature, pstateCur, freq0, freq1, ...].
+    /// The count depends on the core count, so ask for a generous buffer and
+    /// use whatever the kernel reports back.
+    func metrics() -> (kr: kern_return_t, values: [Float]) {
+        let maxCores = 64
+        let r = structureCall(4, outBytes: (maxCores + 3) * 4)
+        let v = asF32(r.bytes, maxCores + 3)
+        return (r.kr, v)
     }
 
-    /// Selector 11: [supported, enabled] for CPB.
-    func cpb() -> (supported: Bool, enabled: Bool) {
-        var out = [UInt64](repeating: 0, count: 2)
-        var outCount: UInt32 = 2
-        let kr = IOConnectCallScalarMethod(connect, 11, nil, 0, &out, &outCount)
-        guard kr == KERN_SUCCESS else { return (false, false) }
-        return (out[0] != 0, out[1] != 0)
+    /// Selector 9: one uint64, the current PStateCtl.
+    func currentPState() -> (kr: kern_return_t, state: Int) {
+        let r = structureCall(9, outBytes: 8)
+        let v = asU64(r.bytes, 1)
+        return (r.kr, Int(v[0]))
     }
 
-    /// Selector 8: kext version string.
+    /// Selector 11: [cpbSupported, cpbState].
+    func cpb() -> (kr: kern_return_t, supported: Bool, enabled: Bool) {
+        let r = structureCall(11, outBytes: 16)
+        let v = asU64(r.bytes, 2)
+        return (r.kr, v[0] != 0, v[1] != 0)
+    }
+
+    /// Selector 8: version string, also structure output.
     func version() -> String {
-        var buf = [CChar](repeating: 0, count: 128)
-        var size = 128
+        var buf = [UInt8](repeating: 0, count: 64)
+        var size = 64
         let kr = IOConnectCallMethod(connect, 8, nil, 0, nil, 0,
                                      nil, nil, &buf, &size)
         guard kr == KERN_SUCCESS else { return "?" }
-        return String(cString: buf)
+        return String(cString: buf.map { CChar(bitPattern: $0) })
     }
 }
-
-// MARK: - Sampling
 
 struct Sample {
     let pstate: Int
@@ -148,88 +160,104 @@ struct Sample {
     let temp: Float
 }
 
-func sampleOnce(_ d: Driver) -> Sample? {
-    guard let ps = d.currentPState() else { return nil }
-    let m = d.metrics()
-    guard m.count > 3 else { return nil }
-    let temp = m.count > 1 ? m[1] : 0
-    let clocks = Array(m[3...])
-    return Sample(pstate: ps, maxClock: clocks.max() ?? 0, temp: temp)
-}
-
-// MARK: - Main
-
 final class PStateProbe {
     static func run() {
-        let args = CommandLine.arguments
-        let seconds = args.count > 1 ? (Int(args[1]) ?? 20) : 20
+        let seconds = CommandLine.arguments.count > 1
+            ? (Int(CommandLine.arguments[1]) ?? 20) : 20
 
         print("=== AMD P-State governor probe ===")
         print("")
 
         let d = Driver()
-        guard d.open() else {
-            print("could not open \(serviceName).")
-            print("is AMDRyzenCPUPowerManagement loaded? check:")
-            print("  ioreg -l | grep -i amdryzen")
+        let opened = d.open()
+        guard opened.ok else {
+            print(String(format: "IOServiceOpen failed: 0x%X", opened.kr))
+            print("kext loaded? check:  kmutil showloaded | grep -i amdryzen")
             exit(1)
         }
         defer { d.close() }
 
         print("kext version : \(d.version())")
 
-        let count = d.pStateCount()
+        // P-State table.
+        let defs = d.pStateDefs()
         let clocks = d.pStateClocks()
-        print("P-State count: \(count)")
-        if !clocks.isEmpty {
-            let s = clocks.map { String(format: "%.0f", $0) }.joined(separator: " ")
+        let validDefs = defs.defs.filter { $0 != 0 }
+        let validClocks = clocks.mhz.filter { $0 > 0 }
+
+        print(String(format: "selector 0   : kr=0x%X  %d non-zero entries",
+                     defs.kr, validDefs.count))
+        if !validClocks.isEmpty {
+            let s = validClocks.map { String(format: "%.0f", $0) }.joined(separator: " ")
             print("P-State MHz  : \(s)")
+        } else {
+            print(String(format: "selector 1   : kr=0x%X  no clocks", clocks.kr))
         }
 
         let c = d.cpb()
-        print("CPB          : \(c.supported ? "supported" : "unsupported"), "
-              + "currently \(c.enabled ? "on" : "off")")
+        print(String(format: "CPB          : kr=0x%X  %@, %@",
+                     c.kr,
+                     c.supported ? "supported" : "unsupported",
+                     c.enabled ? "on" : "off"))
+
+        let ps = d.currentPState()
+        print(String(format: "PStateCtl    : kr=0x%X  %d", ps.kr, ps.state))
         print("")
 
-        // Sample. The caller is expected to idle for the first half and work
-        // for the second, so the two are reported apart.
+        // If even the first read is empty, say so plainly instead of sampling
+        // twenty seconds of nothing.
+        if validClocks.isEmpty && ps.kr != KERN_SUCCESS {
+            print("every selector returned nothing.")
+            print("the connection opened but the client did not start -")
+            print("check:  log show --last 5m | grep AMDCPUSupportUserClient")
+            exit(1)
+        }
+
+        func sampleOnce() -> Sample? {
+            let p = d.currentPState()
+            guard p.kr == KERN_SUCCESS else { return nil }
+            let m = d.metrics()
+            guard m.kr == KERN_SUCCESS, m.values.count > 3 else { return nil }
+            let temp = m.values[1]
+            let freqs = Array(m.values[3...]).filter { $0 > 0 }
+            return Sample(pstate: p.state, maxClock: freqs.max() ?? 0, temp: temp)
+        }
+
         let half = max(1, seconds / 2)
         var first: [Sample] = []
         var second: [Sample] = []
 
-        func tick(_ into: inout [Sample], label: String) {
-            var lastReport = ""
+        func runPhase(_ into: inout [Sample], label: String) {
             for i in 0..<half {
-                if let s = sampleOnce(d) {
+                if let s = sampleOnce() {
                     into.append(s)
-                    lastReport = String(format: "  %@ %2ds  P-State %d  %4.0f MHz  %3.0f C",
-                                        label, i + 1, s.pstate, s.maxClock, s.temp)
-                    print(lastReport)
+                    print(String(format: "  %@ %2ds  P-State %d  %4.0f MHz  %3.0f C",
+                                 label, i + 1, s.pstate, s.maxClock, s.temp))
+                } else {
+                    print("  \(label) \(i+1)s  <no data>")
                 }
                 Thread.sleep(forTimeInterval: 1.0)
             }
         }
 
         print("phase 1 of 2 - stay idle")
-        tick(&first, label: "idle")
+        runPhase(&first, label: "idle")
         print("")
         print("phase 2 of 2 - open something heavy now")
-        tick(&second, label: "load")
+        runPhase(&second, label: "load")
         print("")
 
-        // Summary.
         func summarise(_ s: [Sample], _ name: String) {
             guard !s.isEmpty else { print("\(name): no samples"); return }
             let ps = s.map { $0.pstate }
-            let clocks = s.map { $0.maxClock }
-            let temps = s.map { $0.temp }
-            let distinct = Set(ps).sorted()
+            let cl = s.map { $0.maxClock }
+            let tp = s.map { $0.temp }
             print("\(name):")
-            print("  P-State  min \(ps.min()!)  max \(ps.max()!)  distinct \(distinct)")
+            print("  P-State  min \(ps.min()!)  max \(ps.max()!)  distinct \(Set(ps).sorted())")
             print(String(format: "  clock    min %.0f  max %.0f  avg %.0f MHz",
-                         clocks.min()!, clocks.max()!, clocks.reduce(0, +) / Float(clocks.count)))
+                         cl.min()!, cl.max()!, cl.reduce(0, +) / Float(cl.count)))
             print(String(format: "  temp     min %.0f  max %.0f  avg %.0f C",
-                         temps.min()!, temps.max()!, temps.reduce(0, +) / Float(temps.count)))
+                         tp.min()!, tp.max()!, tp.reduce(0, +) / Float(tp.count)))
         }
 
         print("=== summary ===")
@@ -237,30 +265,21 @@ final class PStateProbe {
         summarise(second, "phase 2 (load)")
         print("")
 
-        // Verdict. The governor is judged on whether the index moved at all,
-        // not on how far - a limit of 1 is still a working governor, just a
-        // very narrow one, and that distinction matters for what to change.
         let all = first + second
-        let allStates = Set(all.map { $0.pstate })
-        let allClocks = all.map { $0.maxClock }
+        let states = Set(all.map { $0.pstate })
+        let clocksAll = all.map { $0.maxClock }
 
         print("=== verdict ===")
-        if allStates.count > 1 {
-            print("  governor ALIVE: P-State index moved between \(allStates.sorted())")
+        if states.count > 1 {
+            print("  governor ALIVE: P-State moved between \(states.sorted())")
             print("  the load-based governor in pmRyzen_machine_idle() is working.")
         } else {
-            print("  governor DEAD: P-State stayed at \(allStates.first ?? -1) for every sample")
-            print("  either pmRyzen_pstatelimit is 0/1, or _tscFreq was missing at boot.")
-            print("  check the kext log:  log show --last boot | grep -i amdcpu")
+            print("  governor STUCK: P-State stayed at \(states.first ?? -1) for every sample")
+            print("  either pmRyzen_pstatelimit is 0, or _tscFreq was missing at boot.")
+            print("  check:  log show --last boot | grep -i amdcpu")
         }
-
-        if let lo = allClocks.min(), let hi = allClocks.max() {
-            let swing = hi - lo
-            print(String(format: "  clock swing: %.0f MHz (%.0f -> %.0f)", swing, lo, hi))
-            if swing < 200 && allStates.count <= 1 {
-                print("  a swing this small with a fixed P-State means the CPU")
-                print("  never left one operating point - consistent with a dead governor.")
-            }
+        if let lo = clocksAll.min(), let hi = clocksAll.max() {
+            print(String(format: "  clock swing: %.0f MHz (%.0f -> %.0f)", hi - lo, lo, hi))
         }
     }
 }
